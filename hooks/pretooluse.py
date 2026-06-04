@@ -12,10 +12,13 @@ import shlex
 import sys
 
 # Cheap, never-interactive commands: not worth the wrapper noise.
+# Only skipped when the WHOLE command is one simple cheap command — a cheap
+# prefix must not exempt what follows it (`echo hi && ./slow.sh`).
 SKIP_RE = re.compile(
     r'^(?:ls|pwd|echo|printf|which|whoami|date|true|false|'
     r'git\s+(?:status|log|diff|show|branch|remote|rev-parse)\b)'
 )
+SHELL_OPS_RE = re.compile(r'[|&;<>`$(\n]')
 
 # `STALL_GUARD_IDLE=120 cmd` style prefixes must configure the guard itself,
 # so hoist them out of the child command.
@@ -43,7 +46,7 @@ def main():
     # sudo via GUI askpass legitimately sits quiet while the user reads the dialog
     if re.search(r'\bsudo\b', cmd):
         return
-    if SKIP_RE.match(cmd):
+    if SKIP_RE.match(cmd) and not SHELL_OPS_RE.search(cmd):
         return
 
     guard = os.path.join(

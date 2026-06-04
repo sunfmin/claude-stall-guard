@@ -125,6 +125,14 @@ skip_case "already wrapped" '{"tool_name":"Bash","tool_input":{"command":"bin/st
 skip_case "cheap command (git status)" '{"tool_name":"Bash","tool_input":{"command":"git status"}}'
 skip_case "non-Bash tool" '{"tool_name":"Read","tool_input":{"file_path":"/etc/hosts"}}'
 
+# a cheap prefix must NOT exempt a compound command from guarding
+out=$(hook_out '{"tool_name":"Bash","tool_input":{"command":"echo starting && bash tests/blocked-prompt.sh"}}')
+if grep -q 'updatedInput' <<<"$out" && grep -q 'stall-guard' <<<"$out"; then
+  note "PASS  hook wraps compound command with cheap prefix"; PASS=$((PASS+1))
+else
+  note "FAIL  compound with cheap prefix should be wrapped: $out"; FAIL=$((FAIL+1))
+fi
+
 # STALL_GUARD_* env prefix is hoisted to configure the guard
 out=$(hook_out '{"tool_name":"Bash","tool_input":{"command":"STALL_GUARD_IDLE=120 ./deploy.sh"}}')
 if grep -qE '"command": "STALL_GUARD_IDLE=120 .*stall-guard' <<<"$out"; then
