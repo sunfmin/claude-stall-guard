@@ -41,32 +41,48 @@ run_case() {
 
 note "── stall-guard core ──"
 
-run_case "yn-prompt detected fast" 99 "STALL DETECTED" "" 12 -- \
-  "$GUARD" --prompt-idle 3 --idle 20 -c 'bash tests/fake-installer.sh'
+# stdin=/dev/null: stdin-reading prompts self-resolve via EOF — no stall, no kill
+run_case "stdin-EOF self-resolves y/N prompt" 0 "installed." "STALL DETECTED" 8 -- \
+  "$GUARD" --idle 20 -c 'bash tests/fake-installer.sh'
 
-run_case "password prompt detected" 99 "credential prompt" "" 12 -- \
-  "$GUARD" --prompt-idle 3 --idle 20 -c 'bash tests/password-prompt.sh'
+run_case "stdin-EOF self-resolves password prompt" 0 "authenticated." "STALL DETECTED" 8 -- \
+  "$GUARD" --idle 20 -c 'bash tests/password-prompt.sh'
 
-run_case "npm-init default-value prompt" 99 "STALL DETECTED" "" 12 -- \
-  "$GUARD" --prompt-idle 3 --idle 20 -c 'bash tests/npm-init-style.sh'
+run_case "stdin-EOF self-resolves npm-init prompt" 0 "name=" "STALL DETECTED" 8 -- \
+  "$GUARD" --idle 20 -c 'bash tests/npm-init-style.sh'
+
+# own session, no controlling terminal: /dev/tty prompts fail fast
+run_case "no ctty: /dev/tty read fails fast" 1 "/dev/tty" "got" 8 -- \
+  "$GUARD" --idle 20 -c 'read -r x < /dev/tty && echo got'
+
+# no tty on stdout: git never starts a pager, even when configured to
+run_case "git pager not invoked" 0 "pager-ok" "STALL DETECTED" 8 -- \
+  "$GUARD" --idle 20 -c 'git -c core.pager=less log --oneline -1 && echo pager-ok'
+
+# a prompt blocked on an fd that EOF can't resolve is still a stall
+run_case "EOF-immune blocked prompt killed" 99 "STALL DETECTED" "" 12 -- \
+  "$GUARD" --idle 3 -c 'bash tests/blocked-prompt.sh'
+
+run_case "probe reports blocked-at evidence" 99 "blocked at:" "" 12 -- \
+  "$GUARD" --idle 4 -c 'sleep 60'
 
 run_case "cpu-busy silent NOT killed" 0 "done" "STALL DETECTED" 20 -- \
-  "$GUARD" --prompt-idle 3 --idle 5 -c 'bash tests/quiet-worker.sh'
+  "$GUARD" --idle 5 -c 'bash tests/quiet-worker.sh'
 
 run_case "slow output NOT killed" 0 "finished" "STALL DETECTED" 15 -- \
-  "$GUARD" --prompt-idle 3 --idle 5 -c 'bash tests/slow-echo.sh'
+  "$GUARD" --idle 5 -c 'bash tests/slow-echo.sh'
 
 run_case "net-active silent NOT killed" 0 "net-done" "STALL DETECTED" 20 -- \
-  "$GUARD" --prompt-idle 3 --idle 5 -c 'bash tests/net-quiet.sh'
-
-run_case "generic silent stall (sleep)" 99 "completely idle" "" 12 -- \
-  "$GUARD" --prompt-idle 3 --idle 4 -c 'sleep 60'
+  "$GUARD" --idle 5 -c 'bash tests/net-quiet.sh'
 
 run_case "exit code passthrough" 7 "" "STALL DETECTED" 8 -- \
   "$GUARD" -c 'exit 7'
 
 run_case "stdout passthrough" 0 "hello-world" "STALL DETECTED" 8 -- \
   "$GUARD" -c 'echo hello-world'
+
+run_case "stderr passthrough" 0 "on-stderr" "STALL DETECTED" 8 -- \
+  "$GUARD" -c 'echo on-stderr >&2'
 
 note ""
 note "── PreToolUse hook ──"
@@ -83,9 +99,9 @@ else
 fi
 
 # wrapped command actually runs and detects the stall (simulating the harness)
-wrapped=$(hook_out '{"tool_name":"Bash","tool_input":{"command":"bash tests/fake-installer.sh"}}' \
+wrapped=$(hook_out '{"tool_name":"Bash","tool_input":{"command":"bash tests/blocked-prompt.sh"}}' \
   | python3 -c 'import json,sys;print(json.load(sys.stdin)["hookSpecificOutput"]["updatedInput"]["command"])')
-out=$(STALL_GUARD_PROMPT_IDLE=3 bash -c "$wrapped" 2>&1); code=$?
+out=$(STALL_GUARD_IDLE=3 bash -c "$wrapped" 2>&1); code=$?
 if [ "$code" -eq 99 ] && grep -q "STALL DETECTED" <<<"$out"; then
   note "PASS  hook-wrapped command stalls correctly (exit 99)"; PASS=$((PASS+1))
 else

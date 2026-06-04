@@ -1,86 +1,57 @@
 #!/usr/bin/env python3
 """
-stall-guard — run a command under a PTY and detect when it stalls waiting
-for interactive input, instead of hanging until the harness timeout.
+stall-guard — run a command with hardened stdio (no TTY: stdin=/dev/null,
+own session, piped stdout/stderr) and detect when it stalls, instead of
+hanging until the harness timeout.
 
-Detection model ("progress" = new PTY output OR CPU time advancing OR
-network traffic moving in the child's process group):
+Without a TTY most interactive prompts resolve themselves: reading stdin
+hits EOF instantly (apt prints "Abort.", `read` returns non-zero), and
+open("/dev/tty") fails because the child runs in its own session with no
+controlling terminal. Pagers and wizards never even start. What remains
+are genuine hangs — a dead network peer, a read on an fd that never
+delivers, a deadlock — and those are what the watchdog catches.
 
-  - progress stopped AND the last output line looks like an interactive
-    prompt                      -> stall after --prompt-idle seconds (def 10)
-  - progress stopped, no recognizable prompt
-                                -> stall after --idle seconds (def 30)
-  - CPU-busy but silent (compiler, test run, ...) keeps making "progress"
-    and is never killed.
-  - silent + idle CPU but network bytes still flowing (slow download,
-    long server round-trip) also counts as progress and is never killed.
-    (macOS: per-pid bytes via `nettop -n`; Linux: rchar/wchar from
-    /proc/<pid>/io, i.e. any I/O counts.)
+"Progress" = new output on stdout/stderr OR CPU time advancing OR network
+traffic moving in the child's process group. No progress for --idle
+seconds (default 30) = stall. CPU-busy-but-silent (compiler, tests) and
+silent-but-downloading processes keep making progress and are never
+killed. (macOS net: per-pid bytes via `nettop -n`; Linux: rchar/wchar
+from /proc/<pid>/io, i.e. any I/O counts.)
 
-On stall: the whole process group gets SIGTERM (then SIGKILL after 2s), a
-clearly marked report is printed for Claude to read, and stall-guard exits
-with code 99. Otherwise the child's exit code is passed through.
+On stall the process group is first PROBED for what it is blocked on —
+Linux: /proc/<pid>/wchan + /proc/<pid>/syscall (+ readlink of the fd a
+read is stuck on); macOS: sample(1) kernel leaf frames, falling back to
+ps state — then SIGTERM'd (SIGKILL after 2s). A short report with the
+evidence is printed and stall-guard exits with code 99. Otherwise the
+child's exit code is passed through.
 
 Usage:
-  stall-guard -c 'npm init'                # command string via bash -c
-  stall-guard -- python3 setup.py install  # argv form
-Env overrides: STALL_GUARD_IDLE, STALL_GUARD_PROMPT_IDLE, STALL_GUARD_TERM
+  stall-guard -c 'curl https://stalled.example/big'   # command string
+  stall-guard -- python3 setup.py install             # argv form
+Env overrides: STALL_GUARD_IDLE, STALL_GUARD_TERM
 """
 
 import argparse
 import os
-import pty
 import re
 import select
 import signal
-import struct
 import subprocess
 import sys
 import time
-
-import fcntl
-import termios
 
 STALL_EXIT = 99
 TAIL_BYTES = 4096
 CPU_EPSILON = 0.02  # cputime seconds that count as "advancing"
 NET_EPSILON = 64    # traffic bytes that count as "moving" (filters ACK-level noise)
 NET_MAX_FAILS = 3   # consecutive sampling failures before giving up on net checks
+PROBE_MAX_PIDS = 4  # blocked-at probe cost cap (macOS sample is ~0.3s/pid)
 
 ANSI_RE = re.compile(
     rb'\x1b\[[0-9;?]*[ -/]*[@-~]'            # CSI sequences
     rb'|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)'    # OSC sequences
     rb'|\x1b[@-_]'                            # other escapes
 )
-
-# Ordered: most specific first. Matched against the last non-empty,
-# ANSI-stripped output line.
-PROMPT_PATTERNS = [
-    ('yes/no choice',
-     re.compile(r'[\(\[](?:y(?:es)?\s*[/|]\s*no?|no?\s*[/|]\s*y(?:es)?)[\)\]]\s*[?:]?\s*$', re.I)),
-    ('credential prompt',
-     re.compile(r'(?:password|passphrase|username|user name|login|email|token|otp|2fa|pin|passcode)\b[^:]{0,20}:\s*$', re.I)),
-    ('press-enter prompt',
-     re.compile(r'(?:press|hit)\s+(?:any key|enter|return)', re.I)),
-    ('confirmation request',
-     re.compile(r'are you sure', re.I)),
-    ('confirm keyword',
-     re.compile(r'\b(?:ok to proceed|proceed|continue|overwrite|replace|confirm|trust)\b[^a-z]{0,10}$', re.I)),
-    ('default-value prompt',          # e.g. npm init: "package name: (demo) "
-     re.compile(r':\s*\([^)]*\)\s*$')),
-    ('inquirer-style question',
-     re.compile(r'^\?\s')),
-    ('selector arrow',
-     re.compile(r'[❯›]\s')),
-    ('question mark',
-     re.compile(r'\?\s*$')),
-    ('REPL prompt',
-     re.compile(r'^(?:>>>|\.\.\.|>|\$|#|%|In \[\d*\]:)\s*$')),
-    ('shell prompt',
-     re.compile(r'^[\w.@-]*[$#%]\s*$')),
-    ('trailing colon/bracket',        # weakest; only fires when fully idle anyway
-     re.compile(r'[:>]\s*$')),
-]
 
 
 def env_float(name, default):
@@ -163,64 +134,163 @@ def stripped_lines(tail):
     return text.decode('utf-8', 'replace').split('\n')
 
 
-def last_line(tail):
-    for line in reversed(stripped_lines(tail)):
-        line = line.strip()
-        if line:
-            return line
-    return ''
+# ── blocked-at probe ────────────────────────────────────────────────────
+# Best-effort, runs once at stall time: ask the OS what each process in
+# the group is blocked on, so the report carries evidence, not guesses.
+
+WAIT_LABELS = [   # matched against syscall numbers' names / wchan / sample frames
+    ('waiting on a lock/condition',
+     re.compile(r'futex|psynch|cvwait|ulock|mutex')),
+    ('waiting for a child process',
+     re.compile(r'wait4|waitpid|do_wait')),
+    ('waiting for an incoming connection',
+     re.compile(r'accept')),
+    ('waiting for a connection to open',
+     re.compile(r'connect')),
+    ('blocked in read',
+     re.compile(r'(?:^|_)p?read|recv|pipe_r|sk_wait|tty_read|unix_stream')),
+    ('waiting on file descriptors (select/poll/kevent)',
+     re.compile(r'select|poll|epoll|kevent')),
+    ('sleeping on a timer',
+     re.compile(r'sleep|semwait|hrtimer')),
+]
+
+SYSCALL_NAMES = {   # the blocking syscalls we care to name, per Linux arch
+    'x86_64': {0: 'read', 7: 'poll', 17: 'pread64', 23: 'select', 35: 'nanosleep',
+               43: 'accept', 45: 'recvfrom', 47: 'recvmsg', 61: 'wait4',
+               202: 'futex', 230: 'clock_nanosleep', 232: 'epoll_wait',
+               270: 'pselect6', 271: 'ppoll', 281: 'epoll_pwait', 288: 'accept4'},
+    'aarch64': {22: 'epoll_pwait', 63: 'read', 67: 'pread64', 72: 'pselect6',
+                73: 'ppoll', 98: 'futex', 101: 'nanosleep', 115: 'clock_nanosleep',
+                202: 'accept', 207: 'recvfrom', 212: 'recvmsg', 242: 'accept4',
+                260: 'wait4'},
+}
+READ_CALLS = {'read', 'pread64', 'recvfrom', 'recvmsg'}
+MACOS_NOISE_FRAMES = {  # background-thread parking, not what the process waits on
+    'mach_msg', 'mach_msg_trap', 'mach_msg2_trap', 'mach_msg_overwrite_trap',
+    'workq_kernreturn', '__workq_kernreturn',
+}
 
 
-def looks_like_prompt(line):
-    if not line:
-        return None
-    for label, rx in PROMPT_PATTERNS:
-        if rx.search(line):
-            return label
+def classify_wait(names):
+    for name in names:
+        for label, rx in WAIT_LABELS:
+            if rx.search(name):
+                return label
     return None
 
 
-def kill_group(pid):
+def probe_pid_linux(pid):
+    """-> (comm, evidence) or None."""
+    try:
+        with open(f'/proc/{pid}/comm') as f:
+            comm = f.read().strip()
+    except OSError:
+        return None
+    names, detail = [], ''
+    try:
+        parts = open(f'/proc/{pid}/syscall').read().split()
+    except OSError:
+        parts = []
+    if parts and parts[0].isdigit():
+        nr = int(parts[0])
+        name = SYSCALL_NAMES.get(os.uname().machine, {}).get(nr, f'syscall#{nr}')
+        names.append(name)
+        if name in READ_CALLS and len(parts) > 1:
+            try:
+                fd = int(parts[1], 16)
+                detail = f' (fd {fd} → {os.readlink(f"/proc/{pid}/fd/{fd}")})'
+            except (OSError, ValueError):
+                pass
+    try:
+        wchan = open(f'/proc/{pid}/wchan').read().strip()
+        if wchan and wchan != '0':
+            names.append(wchan)
+    except OSError:
+        pass
+    if not names:
+        return None
+    label = classify_wait(names) or 'blocked'
+    return comm, f'{label}{detail} [{", ".join(names)}]'
+
+
+def probe_pid_macos(pid):
+    """-> (comm, evidence) or None. sample(1) works on own processes, no root."""
+    try:
+        comm = subprocess.run(['ps', '-o', 'comm=', '-p', str(pid)],
+                              capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        comm = ''
+    comm = os.path.basename(comm) or '?'
+    try:
+        s = subprocess.run(['sample', str(pid), '0.3', '20', '-file', '/dev/stdout'],
+                           capture_output=True, text=True, timeout=15)
+        frames = re.findall(r'(\w+)\s+\(in libsystem_kernel\.dylib\)', s.stdout)
+    except Exception:
+        frames = []
+    names = []                      # call-graph order: main thread's leaf first
+    for f in frames:
+        if f not in names and f not in MACOS_NOISE_FRAMES:
+            names.append(f)
+    if names:
+        label = classify_wait(names) or 'blocked'
+        return comm, f'{label} [{", ".join(names[:3])}]'
+    try:                            # sample refused (hardened binary?) — degrade
+        stat = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)],
+                              capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        stat = ''
+    return (comm, f'process state {stat}') if stat else None
+
+
+def probe_group(pids):
+    """Best-effort evidence of what each process in the group is blocked on."""
+    probe = probe_pid_macos if sys.platform == 'darwin' else probe_pid_linux
+    notes = []
+    ordered = sorted(pids, key=int)
+    for pid in ordered[:PROBE_MAX_PIDS]:
+        res = probe(pid)
+        if res:
+            notes.append(f'pid {pid} {res[0]} — {res[1]}')
+    if len(ordered) > PROBE_MAX_PIDS:
+        notes.append(f'(+{len(ordered) - PROBE_MAX_PIDS} more processes not probed)')
+    return notes
+
+
+def kill_group(proc):
     """SIGTERM the child's process group, give it 2s, then SIGKILL."""
     try:
-        os.killpg(pid, signal.SIGTERM)
+        os.killpg(proc.pid, signal.SIGTERM)
     except ProcessLookupError:
         return
-    deadline = time.time() + 2.0
-    while time.time() < deadline:
-        try:
-            if os.waitpid(pid, os.WNOHANG)[0] == pid:
-                break
-        except ChildProcessError:
-            break
-        time.sleep(0.1)
     try:
-        os.killpg(pid, signal.SIGKILL)
+        proc.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    try:
+        proc.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        pass
 
 
-def stall(pid, tail, reason, idle_s):
+def stall(proc, tail, idle_s, pids):
     sys.stdout.flush()
+    notes = probe_group(pids or {str(proc.pid)})    # probe BEFORE killing
     lines = [l for l in stripped_lines(tail) if l.strip()][-10:]
     rep = ['',
-           '[stall-guard] ⛔ STALL DETECTED — command appears to be waiting for interactive input.',
-           f'[stall-guard] reason: {reason} (no output, CPU or network activity for {idle_s:.0f}s)',
+           f'[stall-guard] ⛔ STALL DETECTED — no output, CPU or network progress for {idle_s:.0f}s.',
            '[stall-guard] last output:']
-    rep += [f'[stall-guard]   │ {l}' for l in lines] or ['[stall-guard]   │ (no output at all)']
-    rep += [f'[stall-guard] process group terminated; exit code {STALL_EXIT}.',
-            '[stall-guard] HINT for Claude: do NOT simply re-run this command. Instead:',
-            '[stall-guard]   - use a non-interactive flag (-y / --yes / --non-interactive / CI=1 /',
-            '[stall-guard]     DEBIAN_FRONTEND=noninteractive), or',
-            '[stall-guard]   - pipe the answer in (`yes | cmd`, `printf "ans\\n" | cmd`), or',
-            '[stall-guard]   - ask the user to run it manually in their own terminal (`! cmd`).']
+    rep += [f'[stall-guard]   │ {l}' for l in lines] or ['[stall-guard]   │ (none)']
+    rep += ['[stall-guard] blocked at:']
+    rep += [f'[stall-guard]   │ {n}' for n in notes] or ['[stall-guard]   │ (could not determine)']
+    rep += [f'[stall-guard] process group killed; exit {STALL_EXIT}.']
     print('\n'.join(rep))
     sys.stdout.flush()
-    kill_group(pid)
-    try:
-        os.waitpid(pid, 0)
-    except ChildProcessError:
-        pass
+    kill_group(proc)
     sys.exit(STALL_EXIT)
 
 
@@ -229,9 +299,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('-c', '--command', help='command string, run via bash -c')
     ap.add_argument('--idle', type=float, default=env_float('STALL_GUARD_IDLE', 30),
-                    help='seconds of total inactivity before a generic stall (default 30)')
-    ap.add_argument('--prompt-idle', type=float, default=env_float('STALL_GUARD_PROMPT_IDLE', 10),
-                    help='seconds of inactivity when last line looks like a prompt (default 10)')
+                    help='seconds of total inactivity before declaring a stall (default 30)')
     ap.add_argument('--term', default=os.environ.get('STALL_GUARD_TERM', 'dumb'),
                     help='TERM for the child (default dumb: fewer spinners/ANSI)')
     ap.add_argument('argv', nargs='*', help='command and args (alternative to -c)')
@@ -246,27 +314,26 @@ def main():
     else:
         ap.error('no command given')
 
-    pid, master = pty.fork()
-    if pid == 0:  # child: gets the pty as controlling terminal + stdio
-        os.environ['TERM'] = args.term
-        os.environ['STALL_GUARD_ACTIVE'] = '1'
-        try:
-            os.execvp(child_argv[0], child_argv)
-        except OSError as e:
-            sys.stderr.write(f'stall-guard: exec {child_argv[0]!r} failed: {e}\n')
-            os._exit(127)
-
-    # parent
-    fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 120, 0, 0))
+    env = dict(os.environ, TERM=args.term, STALL_GUARD_ACTIVE='1')
+    try:
+        # start_new_session: own session+group, NO controlling terminal —
+        # /dev/tty opens fail fast. stdin=/dev/null: stdin reads hit EOF fast.
+        proc = subprocess.Popen(child_argv, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                start_new_session=True, env=env)
+    except OSError as e:
+        sys.stderr.write(f'stall-guard: exec {child_argv[0]!r} failed: {e}\n')
+        sys.exit(127)
 
     def forward(sig, _frame):
         try:
-            os.killpg(pid, sig)
+            os.killpg(proc.pid, sig)
         except ProcessLookupError:
             pass
     for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(s, forward)
 
+    streams = {proc.stdout.fileno(): 1, proc.stderr.fileno(): 2}
     start = time.time()
     last_output = start
     last_cpu_adv = start
@@ -276,44 +343,36 @@ def main():
     net_seen = None
     net_fails = 0
     tail = b''
-    child_status = None
-    master_open = True
+    pids = set()
 
     while True:
-        if master_open:
+        if streams:
             try:
-                r, _, _ = select.select([master], [], [], 0.5)
+                r, _, _ = select.select(list(streams), [], [], 0.5)
             except InterruptedError:
                 continue
-            if r:
+            for fd in r:
                 try:
-                    data = os.read(master, 65536)
-                except OSError:      # EIO on Linux when slave side closes
+                    data = os.read(fd, 65536)
+                except OSError:
                     data = b''
                 if data:
-                    os.write(1, data)
+                    os.write(streams[fd], data)
                     tail = (tail + data)[-TAIL_BYTES:]
                     last_output = time.time()
-                else:                # EOF: no process holds the slave anymore
-                    master_open = False
+                else:                # EOF: no process holds this pipe anymore
+                    del streams[fd]
         else:
             time.sleep(0.5)
 
         now = time.time()
 
-        if child_status is None:
-            try:
-                done, status = os.waitpid(pid, os.WNOHANG)
-            except ChildProcessError:
-                done, status = pid, 0
-            if done == pid:
-                child_status = status
-        if child_status is not None and (not master_open or now - last_output > 0.3):
+        if proc.poll() is not None and (not streams or now - last_output > 0.3):
             break
 
         if now - last_sample >= 1.0:
             last_sample = now
-            cpu, pids = tree_stats(pid)
+            cpu, pids = tree_stats(proc.pid)
             if cpu is not None and cpu > cpu_seen + CPU_EPSILON:
                 cpu_seen = cpu
                 last_cpu_adv = now
@@ -330,25 +389,11 @@ def main():
                         last_net_adv = now
 
         idle = now - max(last_output, last_cpu_adv, last_net_adv)
-        if idle >= args.prompt_idle:
-            label = looks_like_prompt(last_line(tail))
-            if label:
-                stall(pid, tail, f'last line looks like an interactive prompt [{label}]', idle)
         if idle >= args.idle:
-            stall(pid, tail, 'no recognizable prompt, but the process went completely idle', idle)
+            stall(proc, tail, idle, pids)
 
-    try:
-        os.close(master)
-    except OSError:
-        pass
-    if child_status is None:
-        try:
-            _, child_status = os.waitpid(pid, 0)
-        except ChildProcessError:
-            child_status = 0
-    if os.WIFSIGNALED(child_status):
-        sys.exit(128 + os.WTERMSIG(child_status))
-    sys.exit(os.WEXITSTATUS(child_status))
+    rc = proc.returncode if proc.returncode is not None else proc.wait()
+    sys.exit(128 - rc if rc < 0 else rc)
 
 
 if __name__ == '__main__':
