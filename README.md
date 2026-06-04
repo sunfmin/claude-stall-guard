@@ -60,8 +60,29 @@ claude          # 首次会询问是否信任本项目的 settings/hooks，选�
 
 ## 全局安装
 
-试验满意后，装到全局让**所有项目**的 Claude Code 会话生效。一行安装（无需
-clone，脚本会自己拉取仓库 tarball）：
+### Homebrew（推荐）
+
+```bash
+brew install sunfmin/tap/claude-stall-guard
+stall-guard-hook enable     # 把 hook 合并进 ~/.claude/settings.json
+```
+
+停用 / 卸载：
+
+```bash
+stall-guard-hook disable    # 只摘掉 settings.json 里自己的条目
+brew uninstall claude-stall-guard
+```
+
+`stall-guard-hook enable|disable|status` 只增删**自己的**那一条 PreToolUse
+条目，其他 hook 与配置一概不动；任何写入前自动备份
+`settings.json.bak-<时间戳>`。条目指向随包安装的 `pretooluse.py`
+（Cellar 路径会重写成稳定的 `opt/` 路径，`brew upgrade` 后不失效）。
+仅对新开的 Claude Code 会话生效，已开的会话需重启。
+
+### 脚本安装（不用 Homebrew）
+
+一行安装（无需 clone，脚本会自己拉取仓库 tarball）：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sunfmin/claude-stall-guard/main/install.sh | bash
@@ -74,19 +95,10 @@ bash install.sh             # 安装 / 更新（幂等）
 bash install.sh --uninstall # 卸载（一行式加 `-s -- --uninstall`）
 ```
 
-安装做三件事：
-
-1. 拷贝 `bin/stall-guard` 与 `hooks/pretooluse.py` 到
-   `~/.local/share/claude-stall-guard/`（hook 按自身相对路径找 guard，
-   二者永远是配套版本）；
-2. 软链 `~/.local/bin/stall-guard`，方便手动使用；
-3. 把 PreToolUse 条目**合并**进 `~/.claude/settings.json`——只追加/刷新
-   自己的条目，其他 hook 与配置一概不动；写入前自动备份为
-   `settings.json.bak-<时间戳>`。
-
-重复运行只刷新文件不重复加条目；卸载移除以上全部（settings 同样先备份）。
-仅对新开的 Claude Code 会话生效，已开的会话需重启。更新本仓库后重跑
-`bash install.sh` 即可升级。
+装到 `~/.local/share/claude-stall-guard/`，软链
+`~/.local/bin/{stall-guard,stall-guard-hook}`，并自动执行
+`stall-guard-hook enable`。卸载移除以上全部（settings 同样先备份）。
+两种安装方式择一即可。
 
 ## 配置（环境变量 / 命令前缀）
 
@@ -103,7 +115,7 @@ bash install.sh --uninstall # 卸载（一行式加 `-s -- --uninstall`）
 ## 测试
 
 ```bash
-bash tests/run-tests.sh   # 22 个用例：检测、误杀防护、退出码透传、hook、安装器
+bash tests/run-tests.sh   # 23 个用例：检测、误杀防护、退出码透传、hook、安装器
 ```
 
 ## 已知限制

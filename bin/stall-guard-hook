@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""stall-guard-hook — enable/disable stall-guard's Claude Code hook globally.
+
+  stall-guard-hook enable     merge one PreToolUse entry into ~/.claude/settings.json
+  stall-guard-hook disable    remove that entry (and only that entry)
+  stall-guard-hook status     show whether the hook is enabled and where it points
+
+Only entries belonging to stall-guard are touched; every other hook and
+setting stays as-is. A timestamped backup is written before any change.
+
+The entry points at the pretooluse.py shipped next to this script
+(../hooks/pretooluse.py), so guard and hook stay a version-matched pair.
+Homebrew Cellar paths are rewritten to the stable opt/ path so the entry
+survives `brew upgrade`.
+"""
+import json
+import os
+import re
+import sys
+import time
+
+SETTINGS = os.path.expanduser('~/.claude/settings.json')
+
+
+def is_ours(cmd):
+    return 'stall-guard' in cmd or '/hooks/pretooluse.py' in cmd
+
+
+def hook_path():
+    p = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                     'hooks', 'pretooluse.py')
+    stable = re.sub(r'/Cellar/([^/]+)/[^/]+/', r'/opt/\1/', p, count=1)
+    if stable != p and os.path.exists(stable):
+        p = stable
+    return p
+
+
+def load():
+    old = None
+    if os.path.exists(SETTINGS):
+        with open(SETTINGS) as f:
+            old = f.read()
+    try:
+        data = json.loads(old) if old and old.strip() else {}
+    except ValueError:
+        sys.exit(f'error: {SETTINGS} is not valid JSON — fix or move it, then re-run')
+    if not isinstance(data, dict):
+        sys.exit(f'error: {SETTINGS} is not a JSON object — fix or move it, then re-run')
+    return data, old
+
+
+def save(data, old):
+    new = json.dumps(data, indent=2) + '\n'
+    if new == (old or ''):
+        return
+    if old is not None:
+        bak = SETTINGS + '.bak-' + time.strftime('%Y%m%d-%H%M%S')
+        with open(bak, 'w') as f:
+            f.write(old)
+        print(f'settings: backup -> {bak}')
+    os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
+    with open(SETTINGS, 'w') as f:
+        f.write(new)
+
+
+def ours_entries(data):
+    return [h for g in data.get('hooks', {}).get('PreToolUse', [])
+            for h in (g.get('hooks') or []) if is_ours(h.get('command') or '')]
+
+
+def prune(data):
+    hooks = data.get('hooks')
+    if isinstance(hooks, dict):
+        if not hooks.get('PreToolUse'):
+            hooks.pop('PreToolUse', None)
+        if not hooks:
+            data.pop('hooks', None)
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else ''
+    if mode not in ('enable', 'disable', 'status'):
+        sys.exit(__doc__.strip())
+
+    data, old = load()
+    ours = ours_entries(data)
+
+    if mode == 'status':
+        for h in ours:
+            print(f'enabled: {h["command"]}')
+        if not ours:
+            print('disabled')
+        return
+
+    if mode == 'enable':
+        target = hook_path()
+        if not os.access(target, os.R_OK):
+            sys.exit(f'error: hook script not found at {target}')
+        cmd = f'"{target}"'
+        if ours:
+            for h in ours:
+                h['command'] = cmd
+            print('settings: hook entry already present (refreshed)')
+        else:
+            data.setdefault('hooks', {}).setdefault('PreToolUse', []).append(
+                {'matcher': 'Bash',
+                 'hooks': [{'type': 'command', 'command': cmd}]})
+            print('settings: hook entry added')
+        print(f'settings: hook -> {cmd}')
+    else:  # disable
+        pre = data.get('hooks', {}).get('PreToolUse', [])
+        for g in pre:
+            g['hooks'] = [h for h in (g.get('hooks') or [])
+                          if not is_ours(h.get('command') or '')]
+        pre[:] = [g for g in pre if g.get('hooks')]
+        print('settings: hook entry removed' if ours
+              else 'settings: hook entry not found')
+
+    prune(data)
+    save(data, old)
+    print('note: new Claude Code sessions pick this up; restart running ones.')
+
+
+if __name__ == '__main__':
+    main()

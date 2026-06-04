@@ -118,6 +118,24 @@ else
 fi
 
 note ""
+note "── stall-guard-hook (in a throwaway \$HOME) ──"
+
+HOOKHOME=$(mktemp -d)
+en=$(HOME="$HOOKHOME" bin/stall-guard-hook enable 2>&1)
+st=$(HOME="$HOOKHOME" bin/stall-guard-hook status 2>&1)
+HOME="$HOOKHOME" bin/stall-guard-hook disable >/dev/null 2>&1
+st2=$(HOME="$HOOKHOME" bin/stall-guard-hook status 2>&1)
+left=$(cat "$HOOKHOME/.claude/settings.json")
+if grep -q 'hook entry added' <<<"$en" \
+   && grep -q '^enabled: .*hooks/pretooluse.py' <<<"$st" \
+   && [ "$st2" = "disabled" ] && [ "$left" = "{}" ]; then
+  note "PASS  stall-guard-hook enable/status/disable round-trip"; PASS=$((PASS+1))
+else
+  note "FAIL  stall-guard-hook: en=$en st=$st st2=$st2 left=$left"; FAIL=$((FAIL+1))
+fi
+rm -rf "$HOOKHOME"
+
+note ""
 note "── install.sh (in a throwaway \$HOME) ──"
 
 FAKEHOME=$(mktemp -d)
