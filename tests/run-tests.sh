@@ -175,6 +175,26 @@ else
 fi
 rm -rf "$FAKEHOME"
 
+# curl | bash path: no checkout in cwd -> installer fetches the repo tarball.
+# Simulated hermetically with a stub curl that emits a locally-built tarball.
+STAGE=$(mktemp -d)
+mkdir -p "$STAGE/claude-stall-guard-main" "$STAGE/fakebin" "$STAGE/empty"
+cp -R bin hooks install.sh "$STAGE/claude-stall-guard-main/"
+tar -czf "$STAGE/repo.tar.gz" -C "$STAGE" claude-stall-guard-main
+printf '#!/bin/sh\ncat "%s"\n' "$STAGE/repo.tar.gz" > "$STAGE/fakebin/curl"
+chmod +x "$STAGE/fakebin/curl"
+FAKEHOME=$(mktemp -d)
+FAKESET="$FAKEHOME/.claude/settings.json"
+ROOT=$PWD
+out=$(cd "$STAGE/empty" && HOME="$FAKEHOME" PATH="$STAGE/fakebin:$PATH" bash 2>&1 < "$ROOT/install.sh" || true)
+if [ -x "$FAKEHOME/.local/share/claude-stall-guard/bin/stall-guard" ] \
+   && [ "$(ours_count)" = 1 ] && grep -q 'fetching' <<<"$out"; then
+  note "PASS  curl|bash install fetches tarball and installs"; PASS=$((PASS+1))
+else
+  note "FAIL  curl|bash install: $out"; FAIL=$((FAIL+1))
+fi
+rm -rf "$FAKEHOME" "$STAGE"
+
 note ""
 note "═══ $PASS passed, $FAIL failed ═══"
 [ "$FAIL" -eq 0 ]

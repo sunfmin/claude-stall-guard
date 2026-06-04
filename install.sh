@@ -4,6 +4,10 @@
 #   bash install.sh              install or update (idempotent)
 #   bash install.sh --uninstall  remove everything it installed
 #
+# One-liner (no clone needed; fetches the repo tarball itself):
+#   curl -fsSL https://raw.githubusercontent.com/sunfmin/claude-stall-guard/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/sunfmin/claude-stall-guard/main/install.sh | bash -s -- --uninstall
+#
 # Layout after install:
 #   ~/.local/share/claude-stall-guard/bin/stall-guard      (the watchdog)
 #   ~/.local/share/claude-stall-guard/hooks/pretooluse.py  (the hook; finds the
@@ -102,8 +106,17 @@ if [ "${1:-}" = "--uninstall" ]; then
   exit 0
 fi
 
-[ -f bin/stall-guard ] && [ -f hooks/pretooluse.py ] \
-  || { echo "error: run from a claude-stall-guard checkout" >&2; exit 1; }
+# No checkout next to us (curl | bash)? Fetch the repo tarball and install from it.
+if [ ! -f bin/stall-guard ] || [ ! -f hooks/pretooluse.py ]; then
+  REPO_TARBALL="https://github.com/sunfmin/claude-stall-guard/archive/refs/heads/main.tar.gz"
+  command -v curl >/dev/null || { echo "error: need curl (or clone the repo and run install.sh there)" >&2; exit 1; }
+  echo "no local checkout — fetching $REPO_TARBALL"
+  TMP=$(mktemp -d)
+  trap 'rm -rf "$TMP"' EXIT
+  curl -fsSL "$REPO_TARBALL" | tar -xz -C "$TMP" --strip-components=1 \
+    || { echo "error: download failed" >&2; exit 1; }
+  cd "$TMP"
+fi
 
 mkdir -p "$SHARE/bin" "$SHARE/hooks" "$(dirname "$BIN_LINK")"
 cp bin/stall-guard "$SHARE/bin/stall-guard"

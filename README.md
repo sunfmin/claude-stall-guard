@@ -60,11 +60,18 @@ claude          # 首次会询问是否信任本项目的 settings/hooks，选�
 
 ## 全局安装
 
-试验满意后，装到全局让**所有项目**的 Claude Code 会话生效：
+试验满意后，装到全局让**所有项目**的 Claude Code 会话生效。一行安装（无需
+clone，脚本会自己拉取仓库 tarball）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sunfmin/claude-stall-guard/main/install.sh | bash
+```
+
+或在 clone 好的仓库里：
 
 ```bash
 bash install.sh             # 安装 / 更新（幂等）
-bash install.sh --uninstall # 卸载
+bash install.sh --uninstall # 卸载（一行式加 `-s -- --uninstall`）
 ```
 
 安装做三件事：
@@ -96,7 +103,7 @@ bash install.sh --uninstall # 卸载
 ## 测试
 
 ```bash
-bash tests/run-tests.sh   # 21 个用例：检测、误杀防护、退出码透传、hook、安装器
+bash tests/run-tests.sh   # 22 个用例：检测、误杀防护、退出码透传、hook、安装器
 ```
 
 ## 已知限制
