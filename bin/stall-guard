@@ -25,10 +25,15 @@ ps state — then SIGTERM'd (SIGKILL after 2s). A short report with the
 evidence is printed and stall-guard exits with code 99. Otherwise the
 child's exit code is passed through.
 
+-c command strings run under the session shell ($SHELL) when it speaks
+POSIX (bash/zsh/sh/dash/ksh), falling back to bash otherwise — wrapping
+must not change the shell dialect a command is parsed with (on macOS,
+PATH bash is 3.2, which rejects constructs the session zsh accepts).
+
 Usage:
   stall-guard -c 'curl https://stalled.example/big'   # command string
   stall-guard -- python3 setup.py install             # argv form
-Env overrides: STALL_GUARD_IDLE, STALL_GUARD_TERM
+Env overrides: STALL_GUARD_IDLE, STALL_GUARD_TERM, STALL_GUARD_SHELL
 """
 
 import argparse
@@ -59,6 +64,20 @@ def env_float(name, default):
         return float(os.environ.get(name, ''))
     except ValueError:
         return default
+
+
+POSIX_SHELLS = {'bash', 'zsh', 'sh', 'dash', 'ksh'}
+
+
+def pick_shell(explicit):
+    """Interpreter for -c. Transparency: follow the session shell when it
+    speaks POSIX; otherwise (fish, unset) fall back to bash."""
+    if explicit:
+        return explicit
+    sh = os.environ.get('SHELL', '')
+    if os.path.basename(sh) in POSIX_SHELLS and os.access(sh, os.X_OK):
+        return sh
+    return 'bash'
 
 
 def tree_stats(pgid):
@@ -302,13 +321,15 @@ def main():
                     help='seconds of total inactivity before declaring a stall (default 30)')
     ap.add_argument('--term', default=os.environ.get('STALL_GUARD_TERM', 'dumb'),
                     help='TERM for the child (default dumb: fewer spinners/ANSI)')
+    ap.add_argument('--shell', default=os.environ.get('STALL_GUARD_SHELL', ''),
+                    help='interpreter for -c (default: $SHELL if POSIX-family, else bash)')
     ap.add_argument('argv', nargs='*', help='command and args (alternative to -c)')
     args = ap.parse_args()
 
     if args.command and args.argv:
         ap.error('use either -c or argv form, not both')
     if args.command:
-        child_argv = ['bash', '-c', args.command]
+        child_argv = [pick_shell(args.shell), '-c', args.command]
     elif args.argv:
         child_argv = args.argv
     else:

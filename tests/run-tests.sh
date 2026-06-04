@@ -84,6 +84,17 @@ run_case "stdout passthrough" 0 "hello-world" "STALL DETECTED" 8 -- \
 run_case "stderr passthrough" 0 "on-stderr" "STALL DETECTED" 8 -- \
   "$GUARD" -c 'echo on-stderr >&2'
 
+# -c follows the session shell: zsh parses what /bin/bash 3.2 cannot
+run_case "session shell honored (zsh construct)" 0 "PARSED-OK" "unexpected EOF" 8 -- \
+  env SHELL=/bin/zsh "$GUARD" -c "$(cat tests/heredoc-cmdsubst.sh)"
+
+# non-POSIX session shell falls back to bash ($0 reveals the interpreter)
+run_case "fish SHELL falls back to bash" 0 "shell=bash" "" 8 -- \
+  env SHELL=/usr/bin/fish "$GUARD" -c 'echo shell=$0'
+
+run_case "STALL_GUARD_SHELL explicit override" 0 "shell=/bin/bash" "" 8 -- \
+  env SHELL=/bin/zsh STALL_GUARD_SHELL=/bin/bash "$GUARD" -c 'echo shell=$0'
+
 note ""
 note "── PreToolUse hook ──"
 

@@ -7,6 +7,9 @@
 
 `bin/stall-guard` **不用 PTY**。它给子命令一套加固过的 stdio：
 `stdin=/dev/null`、独立 session（无 controlling terminal）、stdout/stderr 走管道。
+`-c` 字符串交给**会话 shell**（`$SHELL`，限 POSIX 家族；fish 等回落到 bash）
+解析——包装不得改变命令的方言（macOS 的 PATH bash 是 3.2，啃不动会话 zsh
+能解析的结构）。
 仅这一步就消解了绝大多数"等输入"——根本轮不到检测：
 
 - 读 stdin 的提示立刻吃到 EOF，自行了断（`apt` 打印 `Abort.`，`read` 直接返回）；
@@ -127,6 +130,7 @@ bash install.sh --uninstall # 卸载（一行式加 `-s -- --uninstall`）
 |------|------|------|
 | `STALL_GUARD_IDLE` | 30 | 无 progress 多少秒判定卡死 |
 | `STALL_GUARD_TERM` | dumb | 子进程 TERM（dumb 可减少 spinner/ANSI 干扰） |
+| `STALL_GUARD_SHELL` | （自动） | `-c` 的解释器；默认 `$SHELL`（POSIX 家族），否则 bash |
 | `STALL_GUARD_DISABLE` | - | `=1` 时 hook 不包装任何命令 |
 
 在对话里也可以对单条命令临时调参——hook 会把 `STALL_GUARD_*` 前缀提升到
