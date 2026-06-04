@@ -170,6 +170,36 @@ else
 fi
 rm -rf "$HOOKHOME"
 
+# ownership is marker-based: a foreign hooks/pretooluse.py entry is not ours
+HOOKHOME=$(mktemp -d)
+mkdir -p "$HOOKHOME/.claude"
+printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/some/other/tool/hooks/pretooluse.py"}]}]}}' \
+  > "$HOOKHOME/.claude/settings.json"
+HOME="$HOOKHOME" bin/stall-guard-hook enable >/dev/null 2>&1
+marked=$(grep -c '#claude-stall-guard' "$HOOKHOME/.claude/settings.json")
+HOME="$HOOKHOME" bin/stall-guard-hook disable >/dev/null 2>&1
+if [ "$marked" -ge 1 ] \
+   && grep -q '/some/other/tool/hooks/pretooluse.py' "$HOOKHOME/.claude/settings.json" \
+   && ! grep -q '#claude-stall-guard' "$HOOKHOME/.claude/settings.json"; then
+  note "PASS  foreign hooks/pretooluse.py survives enable+disable; ours marked"; PASS=$((PASS+1))
+else
+  note "FAIL  marker ownership: $(cat "$HOOKHOME/.claude/settings.json")"; FAIL=$((FAIL+1))
+fi
+rm -rf "$HOOKHOME"
+
+# legacy pre-marker entries (stall-guard in path, no marker) still removed
+HOOKHOME=$(mktemp -d)
+mkdir -p "$HOOKHOME/.claude"
+printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/opt/homebrew/opt/claude-stall-guard/libexec/hooks/pretooluse.py"}]}]}}' \
+  > "$HOOKHOME/.claude/settings.json"
+HOME="$HOOKHOME" bin/stall-guard-hook disable >/dev/null 2>&1
+if [ "$(cat "$HOOKHOME/.claude/settings.json")" = "{}" ]; then
+  note "PASS  legacy pre-marker entry removed by disable"; PASS=$((PASS+1))
+else
+  note "FAIL  legacy removal: $(cat "$HOOKHOME/.claude/settings.json")"; FAIL=$((FAIL+1))
+fi
+rm -rf "$HOOKHOME"
+
 note ""
 note "── install.sh (in a throwaway \$HOME) ──"
 

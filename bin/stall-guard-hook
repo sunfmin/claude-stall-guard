@@ -7,6 +7,10 @@
 
 Only entries belonging to stall-guard are touched; every other hook and
 setting stays as-is. A timestamped backup is written before any change.
+Ownership is marker-based: enable writes a trailing `#claude-stall-guard`
+shell comment into the entry's command, and only marked (or legacy
+stall-guard-pathed) entries are ever claimed — a foreign tool's
+hooks/pretooluse.py is left alone.
 
 The entry points at the pretooluse.py shipped next to this script
 (../hooks/pretooluse.py), so guard and hook stay a version-matched pair.
@@ -21,9 +25,15 @@ import time
 
 SETTINGS = os.path.expanduser('~/.claude/settings.json')
 
+# Trailing shell comment marking an entry as ours; comments don't affect
+# execution. The bare 'stall-guard' substring keeps recognizing pre-marker
+# installs (their paths all contain it). A generic '/hooks/pretooluse.py'
+# path is NOT enough — that could be someone else's hook.
+MARKER = '#claude-stall-guard'
+
 
 def is_ours(cmd):
-    return 'stall-guard' in cmd or '/hooks/pretooluse.py' in cmd
+    return MARKER in cmd or 'stall-guard' in cmd
 
 
 def hook_path():
@@ -96,7 +106,7 @@ def main():
         target = hook_path()
         if not os.access(target, os.R_OK):
             sys.exit(f'error: hook script not found at {target}')
-        cmd = f'"{target}"'
+        cmd = f'"{target}" {MARKER}'
         if ours:
             for h in ours:
                 h['command'] = cmd
