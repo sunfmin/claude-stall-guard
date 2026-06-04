@@ -9,13 +9,19 @@ Claude Code 的 Bash 工具没有 TTY，命令一旦弹出交互提示（`(y/N)`
 ## 工作原理
 
 `bin/stall-guard` 在伪终端（PTY）下运行命令，并定义 **progress = 有新输出 或
-进程组 CPU 时间在前进**：
+进程组 CPU 时间在前进 或 进程组网络流量在动**：
 
 | 情况 | 判定 | 默认等待 |
 |------|------|----------|
 | 无 progress，且最后一行长得像交互提示（`(y/N)`、`Password:`、`? xxx`、npm 默认值提示等） | 卡在等输入 | 10s（`--prompt-idle`） |
 | 无 progress，无可识别提示 | 通用卡死 | 30s（`--idle`） |
 | 安静但 CPU 在忙（编译、测试…） | 正常工作 | 永不杀 |
+| 安静、CPU 也闲，但网络字节数在变（慢下载、等服务端长响应…） | 正常工作 | 永不杀 |
+
+网络检测看的是进程组的**累计字节计数器是否变化**（macOS 用 `nettop -n`，无需
+root，单次采样约 10ms；Linux 退化为 `/proc/<pid>/io` 的 `rchar/wchar`，即任何
+I/O 前进都算 progress）。只持有空闲连接不算——卡在提示上的进程也常挂着 keepalive。
+`nettop` 不可用时自动放弃网络检测，行为退回到只看输出 + CPU。
 
 判定卡住后：SIGTERM→SIGKILL 整个进程组，打印带 `[stall-guard] ⛔ STALL DETECTED`
 标记的报告（含最后输出 + 给 Claude 的下一步建议），**退出码 99**。
@@ -52,6 +58,29 @@ claude          # 首次会询问是否信任本项目的 settings/hooks，选�
 预期：~10 秒后 Claude 收到 `[stall-guard] ⛔ STALL DETECTED`（exit 99），并主动
 改用非交互方式（如 `yes | …`）或交还给你。
 
+## 全局安装
+
+试验满意后，装到全局让**所有项目**的 Claude Code 会话生效：
+
+```bash
+bash install.sh             # 安装 / 更新（幂等）
+bash install.sh --uninstall # 卸载
+```
+
+安装做三件事：
+
+1. 拷贝 `bin/stall-guard` 与 `hooks/pretooluse.py` 到
+   `~/.local/share/claude-stall-guard/`（hook 按自身相对路径找 guard，
+   二者永远是配套版本）；
+2. 软链 `~/.local/bin/stall-guard`，方便手动使用；
+3. 把 PreToolUse 条目**合并**进 `~/.claude/settings.json`——只追加/刷新
+   自己的条目，其他 hook 与配置一概不动；写入前自动备份为
+   `settings.json.bak-<时间戳>`。
+
+重复运行只刷新文件不重复加条目；卸载移除以上全部（settings 同样先备份）。
+仅对新开的 Claude Code 会话生效，已开的会话需重启。更新本仓库后重跑
+`bash install.sh` 即可升级。
+
 ## 配置（环境变量 / 命令前缀）
 
 | 变量 | 默认 | 说明 |
@@ -67,17 +96,16 @@ claude          # 首次会询问是否信任本项目的 settings/hooks，选�
 ## 测试
 
 ```bash
-bash tests/run-tests.sh   # 16 个用例：检测、误杀防护、退出码透传、hook 行为
+bash tests/run-tests.sh   # 21 个用例：检测、误杀防护、退出码透传、hook、安装器
 ```
 
 ## 已知限制
 
-- 纯启发式：持续动画的 spinner 会被当作"有输出"；零输出零 CPU 的合法等待
-  （如长时间纯网络静默）超过 `--idle` 会被误杀——用 `STALL_GUARD_IDLE=300` 前缀放宽。
+- 纯启发式：持续动画的 spinner 会被当作"有输出"；零输出、零 CPU、零流量的
+  合法等待（如等定时器、等人工触发的外部事件）超过 `--idle` 仍会被误杀——用
+  `STALL_GUARD_IDLE=300` 前缀放宽。反过来，后台有周期性心跳/遥测流量的进程
+  即使真卡在提示上，也可能因流量被当作 progress 而延迟判定。
 - 检测到卡住只能"杀掉并报告"，无法替你作答；自动应答请用 `yes |` / `expect`。
-- 需要 `ps -o pgid=,time=`（macOS/BSD 自带；Linux procps 同样支持）。
-
-## Roadmap
-
-- [ ] `install.sh`：全局安装（`~/.local/bin/stall-guard` + 合并 hook 到
-  `~/.claude/settings.json`，带备份与卸载）——等本地试验充分后再做。
+- 需要 `ps -o pgid=,pid=,time=`（macOS/BSD 自带；Linux procps 同样支持）。
+  网络检测在 macOS 依赖 `nettop`（系统自带）；Linux 上以 `/proc/<pid>/io`
+  近似（含磁盘 I/O）；都不可用时该项检测自动停用。

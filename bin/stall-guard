@@ -3,8 +3,8 @@
 stall-guard — run a command under a PTY and detect when it stalls waiting
 for interactive input, instead of hanging until the harness timeout.
 
-Detection model ("progress" = new PTY output OR CPU time advancing in the
-child's process group):
+Detection model ("progress" = new PTY output OR CPU time advancing OR
+network traffic moving in the child's process group):
 
   - progress stopped AND the last output line looks like an interactive
     prompt                      -> stall after --prompt-idle seconds (def 10)
@@ -12,6 +12,10 @@ child's process group):
                                 -> stall after --idle seconds (def 30)
   - CPU-busy but silent (compiler, test run, ...) keeps making "progress"
     and is never killed.
+  - silent + idle CPU but network bytes still flowing (slow download,
+    long server round-trip) also counts as progress and is never killed.
+    (macOS: per-pid bytes via `nettop -n`; Linux: rchar/wchar from
+    /proc/<pid>/io, i.e. any I/O counts.)
 
 On stall: the whole process group gets SIGTERM (then SIGKILL after 2s), a
 clearly marked report is printed for Claude to read, and stall-guard exits
@@ -40,6 +44,8 @@ import termios
 STALL_EXIT = 99
 TAIL_BYTES = 4096
 CPU_EPSILON = 0.02  # cputime seconds that count as "advancing"
+NET_EPSILON = 64    # traffic bytes that count as "moving" (filters ACK-level noise)
+NET_MAX_FAILS = 3   # consecutive sampling failures before giving up on net checks
 
 ANSI_RE = re.compile(
     rb'\x1b\[[0-9;?]*[ -/]*[@-~]'            # CSI sequences
@@ -84,26 +90,71 @@ def env_float(name, default):
         return default
 
 
-def tree_cputime(pgid):
-    """Total accumulated CPU time of all processes in pgid, via ps (macOS/BSD)."""
+def tree_stats(pgid):
+    """(total CPU time, set of pid strings) of all processes in pgid, via ps."""
     try:
-        out = subprocess.run(['ps', '-ax', '-o', 'pgid=,time='],
+        out = subprocess.run(['ps', '-ax', '-o', 'pgid=,pid=,time='],
                              capture_output=True, text=True, timeout=5).stdout
     except Exception:
-        return None
-    total = 0.0
+        return None, set()
+    total, pids = 0.0, set()
     target = str(pgid)
     for line in out.splitlines():
         parts = line.split()
-        if len(parts) == 2 and parts[0] == target:
+        if len(parts) == 3 and parts[0] == target:
+            pids.add(parts[1])
             t = 0.0
             try:
-                for field in parts[1].split(':'):
+                for field in parts[2].split(':'):
                     t = t * 60 + float(field.replace(',', '.'))
             except ValueError:
                 t = 0.0
             total += t
-    return total
+    return total, pids
+
+
+def tree_netbytes(pids):
+    """Cumulative network bytes of `pids` (set of pid strings), or None.
+
+    macOS: per-pid bytes_in+bytes_out via `nettop -n` (no root needed, ~10ms).
+    Linux: rchar+wchar from /proc/<pid>/io — counts all I/O, not just network,
+    but any of it moving means the tree is not stalled.
+    Any change (up OR down — a closing connection drops the macOS total) is
+    treated as activity by the caller.
+    """
+    if sys.platform == 'darwin':
+        try:
+            out = subprocess.run(['nettop', '-n', '-P', '-x', '-L', '1',
+                                  '-J', 'bytes_in,bytes_out'],
+                                 capture_output=True, text=True, timeout=5).stdout
+        except Exception:
+            return None
+        total = 0
+        for line in out.splitlines():
+            parts = line.split(',')
+            if parts and parts[-1] == '':
+                parts.pop()                      # rows end with a trailing comma
+            if len(parts) < 3:
+                continue
+            pid = ','.join(parts[:-2]).rpartition('.')[2]   # "name.pid" -> pid
+            if pid in pids:
+                try:
+                    total += int(parts[-2]) + int(parts[-1])
+                except ValueError:
+                    pass
+        return total
+    # Linux fallback
+    total, seen = 0, False
+    for pid in pids:
+        try:
+            with open(f'/proc/{pid}/io', 'rb') as f:
+                for ln in f:
+                    if ln.startswith((b'rchar:', b'wchar:')):
+                        total += int(ln.split()[1])
+                        seen = True
+        except (OSError, ValueError):
+            continue
+    return total if seen else None
 
 
 def stripped_lines(tail):
@@ -154,7 +205,7 @@ def stall(pid, tail, reason, idle_s):
     lines = [l for l in stripped_lines(tail) if l.strip()][-10:]
     rep = ['',
            '[stall-guard] ⛔ STALL DETECTED — command appears to be waiting for interactive input.',
-           f'[stall-guard] reason: {reason} (no output and no CPU activity for {idle_s:.0f}s)',
+           f'[stall-guard] reason: {reason} (no output, CPU or network activity for {idle_s:.0f}s)',
            '[stall-guard] last output:']
     rep += [f'[stall-guard]   │ {l}' for l in lines] or ['[stall-guard]   │ (no output at all)']
     rep += [f'[stall-guard] process group terminated; exit code {STALL_EXIT}.',
@@ -219,8 +270,11 @@ def main():
     start = time.time()
     last_output = start
     last_cpu_adv = start
-    last_cpu_sample = start
+    last_net_adv = start
+    last_sample = start
     cpu_seen = 0.0
+    net_seen = None
+    net_fails = 0
     tail = b''
     child_status = None
     master_open = True
@@ -257,14 +311,25 @@ def main():
         if child_status is not None and (not master_open or now - last_output > 0.3):
             break
 
-        if now - last_cpu_sample >= 1.0:
-            last_cpu_sample = now
-            cpu = tree_cputime(pid)
+        if now - last_sample >= 1.0:
+            last_sample = now
+            cpu, pids = tree_stats(pid)
             if cpu is not None and cpu > cpu_seen + CPU_EPSILON:
                 cpu_seen = cpu
                 last_cpu_adv = now
+            if net_fails < NET_MAX_FAILS and pids:
+                net = tree_netbytes(pids)
+                if net is None:
+                    net_fails += 1
+                else:
+                    net_fails = 0
+                    if net_seen is None:
+                        net_seen = net          # baseline; lifetime totals ≠ activity
+                    elif abs(net - net_seen) > NET_EPSILON:
+                        net_seen = net
+                        last_net_adv = now
 
-        idle = now - max(last_output, last_cpu_adv)
+        idle = now - max(last_output, last_cpu_adv, last_net_adv)
         if idle >= args.prompt_idle:
             label = looks_like_prompt(last_line(tail))
             if label:

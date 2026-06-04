@@ -56,6 +56,9 @@ run_case "cpu-busy silent NOT killed" 0 "done" "STALL DETECTED" 20 -- \
 run_case "slow output NOT killed" 0 "finished" "STALL DETECTED" 15 -- \
   "$GUARD" --prompt-idle 3 --idle 5 -c 'bash tests/slow-echo.sh'
 
+run_case "net-active silent NOT killed" 0 "net-done" "STALL DETECTED" 20 -- \
+  "$GUARD" --prompt-idle 3 --idle 5 -c 'bash tests/net-quiet.sh'
+
 run_case "generic silent stall (sleep)" 99 "completely idle" "" 12 -- \
   "$GUARD" --prompt-idle 3 --idle 4 -c 'sleep 60'
 
@@ -113,6 +116,64 @@ if grep -qE '"command": "STALL_GUARD_IDLE=120 .*stall-guard' <<<"$out"; then
 else
   note "FAIL  env hoist: $out"; FAIL=$((FAIL+1))
 fi
+
+note ""
+note "── install.sh (in a throwaway \$HOME) ──"
+
+FAKEHOME=$(mktemp -d)
+FAKESET="$FAKEHOME/.claude/settings.json"
+ours_count() {
+  python3 - "$FAKESET" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print(0); raise SystemExit
+print(sum(1 for g in d.get('hooks', {}).get('PreToolUse', [])
+          for h in g.get('hooks', []) if 'claude-stall-guard' in h.get('command', '')))
+PY
+}
+
+# seed a settings.json that already has a foreign hook + another setting
+mkdir -p "$FAKEHOME/.claude"
+printf '%s\n' '{"model":"opus","hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/usr/local/bin/other-hook"}]}]}}' > "$FAKESET"
+
+HOME="$FAKEHOME" bash install.sh >/dev/null 2>&1
+if [ -x "$FAKEHOME/.local/share/claude-stall-guard/bin/stall-guard" ] \
+   && [ -L "$FAKEHOME/.local/bin/stall-guard" ] \
+   && [ "$(ours_count)" = 1 ] \
+   && grep -q other-hook "$FAKESET" && grep -q '"model": "opus"' "$FAKESET" \
+   && ls "$FAKEHOME/.claude/"settings.json.bak-* >/dev/null 2>&1; then
+  note "PASS  install merges settings, keeps foreign hook + backup"; PASS=$((PASS+1))
+else
+  note "FAIL  install: $(cat "$FAKESET" 2>&1)"; FAIL=$((FAIL+1))
+fi
+
+HOME="$FAKEHOME" bash install.sh >/dev/null 2>&1
+if [ "$(ours_count)" = 1 ]; then
+  note "PASS  reinstall is idempotent (still one entry)"; PASS=$((PASS+1))
+else
+  note "FAIL  reinstall: $(ours_count) entries"; FAIL=$((FAIL+1))
+fi
+
+out=$(printf '%s' '{"tool_name":"Bash","tool_input":{"command":"npm init"}}' \
+  | python3 "$FAKEHOME/.local/share/claude-stall-guard/hooks/pretooluse.py")
+if grep -q 'claude-stall-guard/bin/stall-guard' <<<"$out"; then
+  note "PASS  installed hook wraps via installed guard"; PASS=$((PASS+1))
+else
+  note "FAIL  installed hook: $out"; FAIL=$((FAIL+1))
+fi
+
+HOME="$FAKEHOME" bash install.sh --uninstall >/dev/null 2>&1
+if [ "$(ours_count)" = 0 ] \
+   && grep -q other-hook "$FAKESET" && grep -q '"model": "opus"' "$FAKESET" \
+   && [ ! -e "$FAKEHOME/.local/share/claude-stall-guard" ] \
+   && [ ! -e "$FAKEHOME/.local/bin/stall-guard" ]; then
+  note "PASS  uninstall removes only our entry + files"; PASS=$((PASS+1))
+else
+  note "FAIL  uninstall: $(cat "$FAKESET" 2>&1)"; FAIL=$((FAIL+1))
+fi
+rm -rf "$FAKEHOME"
 
 note ""
 note "═══ $PASS passed, $FAIL failed ═══"
